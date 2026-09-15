@@ -1,14 +1,16 @@
-"""SQLAlchemy ORM models for chat sessions and messages.
+"""SQLAlchemy ORM models for chat sessions, messages, and transcript chunks.
 
-Only two tables are defined for the initial skeleton:
+Tables:
 1. sessions: tracks conversation sessions with timestamps and metadata.
 2. messages: tracks message history belonging to a session.
+3. chunks: stores embedded transcript chunks for RAG retrieval.
 """
 
 import uuid
-from sqlalchemy import Column, String, Text, DateTime, ForeignKey, func, JSON
+from sqlalchemy import Column, String, Text, DateTime, Integer, ForeignKey, func, JSON, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
+from pgvector.sqlalchemy import Vector
 from app.db import Base
 
 
@@ -45,3 +47,28 @@ class Message(Base):
 
     # Relationship back to session
     session = relationship("Session", back_populates="messages")
+
+
+class Chunk(Base):
+    """Stores an embedded transcript chunk for RAG retrieval.
+
+    Each chunk traces back to its source file and position, enabling
+    citation of the original episode when surfacing answers.
+    """
+
+    __tablename__ = "chunks"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Relative path within the transcript repo, e.g. "episodes/brian-chesky/transcript.md"
+    source_file = Column(String(500), nullable=False, index=True)
+    # Position of this chunk within its source file (0-indexed)
+    chunk_index = Column(Integer, nullable=False)
+    content = Column(Text, nullable=False)
+    # 768 dimensions matches nomic-embed-text output
+    embedding = Column(Vector(768), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("source_file", "chunk_index", name="uq_chunk_source_index"),
+    )
+

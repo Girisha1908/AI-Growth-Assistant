@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "ollama"
     OLLAMA_BASE_URL: str = "http://host.docker.internal:11434"
     OLLAMA_MODEL: str = "llama3.1:8b"
+    # Embedding model is configured separately from the chat model
+    OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
     ANTHROPIC_API_KEY: Optional[str] = None
 
     # API Configuration

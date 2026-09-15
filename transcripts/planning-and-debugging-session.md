@@ -183,3 +183,67 @@ curl.exe -s http://localhost:8000/health/chunks
 - **Total Failures / Dropped Chunks**: 0 (100% success rate across all 100 episodes)
 - **Database**: PostgreSQL 16 with `pgvector` extension active and indexed
 - **Architecture & README**: Updated with subset scope documentation and CLI instructions for full catalog runs.
+
+---
+
+## 6. Phase 3: Semantic Retrieval & Grounded `/chat` Endpoint
+
+### Objectives & Architecture
+1. **Semantic Search (`backend/app/retrieval.py`)**:
+   - Uses `nomic-embed-text` to vectorize search queries.
+   - Executes pgvector cosine distance search (`Chunk.embedding.cosine_distance(query_vector)` via SQLAlchemy).
+   - Applied a distance gating threshold (`MAX_DISTANCE_THRESHOLD = 0.45`). Queries where the closest chunk has distance > 0.45 are treated as "no good match" to eliminate hallucinations.
+2. **Grounded RAG Pipeline (`backend/app/routers/chat.py`)**:
+   - `POST /chat` accepts `{"message": "..."}`.
+   - Formats prompt with retrieved context and strict instruction to answer *only* using provided snippets, replying with `"I don't have enough information from the transcripts to answer that."` if context is insufficient.
+   - Calls Ollama `/api/chat` with model `llama3.2:3b`.
+   - Returns structured `{"answer": "...", "sources": [{"source_file": "...", "chunk_index": ...}]}`.
+3. **Environment & Host Model Setup**:
+   - User pulled `llama3.2:3b` on the host machine (`ollama pull llama3.2:3b`).
+   - Updated `OLLAMA_MODEL=llama3.2:3b` in `.env`, `.env.example`, and `docker-compose.yml`.
+   - Added `./backend/app:/app/app` volume mount to `docker-compose.yml` for live reload.
+   - Set Ollama generation timeout to 300s to reliably support CPU prompt evaluation.
+
+### End-to-End Verification Tests
+
+#### Test 1: North Star Metric
+- **Query**: `"What is a North Star metric and how should product teams choose one?"`
+- **Generated Answer**:
+  > *"A North Star metric is a key metric that a company uses to measure progress and make decisions... According to Dan Hockenmaier, a North Star metric should be a 'proxy that is the best predictor of your liquidity.'... In the context of Shopify, Archie Abrams mentions that the company uses a North Star metric to evaluate the health of its marketplace..."*
+- **Cited Sources**:
+  - `episodes/archie-abrams/transcript.md` (chunk 22)
+  - `episodes/dan-hockenmaier/transcript.md` (chunk 16)
+  - `episodes/benjamin-lauzier/transcript.md` (chunk 9)
+  - `episodes/bill-carr/transcript.md` (chunk 5)
+  - `episodes/archie-abrams/transcript.md` (chunk 13)
+
+#### Test 2: User Retention
+- **Query**: `"How should product teams approach improving user retention?"`
+- **Generated Answer**:
+  > *"Based on the context, it appears that product teams should focus on core product levers rather than growth product levers to improve user retention. According to Dan Hockenmaier, the primary advice is to understand what matters to the customer and improve the customer experience, rather than just relying on growth strategies. Additionally, focusing on the early user experience, particularly in the first week or month, can be effective in teaching users about the product's value and proving its worth..."*
+- **Cited Sources**:
+  - `episodes/albert-cheng/transcript.md` (chunk 14)
+  - `episodes/dan-hockenmaier/transcript.md` (chunk 12)
+  - `episodes/albert-cheng/transcript.md` (chunk 15)
+
+#### Test 3: User Onboarding Principles
+- **Query**: `"What are the key principles for designing effective user onboarding?"`
+- **Generated Answer**:
+  > *"Based on the provided transcript snippets, the key principles for designing effective user onboarding are: 1. Reframe your thinking: Think from the user's perspective... 2. Focus on a single value prop... 3. Don't redesign for redesign's sake... 4. Optimize for the right moments... 5. Consider the user's time... 6. Simplify the value prop... 7. Understand your target user... These principles are emphasized by Anuj Rathi and Adam Fishman in the transcript snippets, and are related to the idea of thinking like a user who is lazy, vain, and selfish..."*
+- **Cited Sources**:
+  - `episodes/anuj-rathi/transcript.md` (chunk 8)
+  - `episodes/adam-fishman/transcript.md` (chunk 24)
+  - `episodes/anuj-rathi/transcript.md` (chunk 10)
+
+#### Test 4: Out-of-Domain Negative Test (Hallucination Prevention)
+- **Query**: `"What is the capital of France?"`
+- **Result**:
+  ```json
+  {
+    "answer": "I don't have enough information from the transcripts to answer that.",
+    "sources": [],
+    "error": null
+  }
+  ```
+  *(Gated immediately by distance threshold; zero hallucination and zero latency).*
+

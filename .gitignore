@@ -48,3 +48,6 @@ Thumbs.db
 
 # Docker
 .docker-cache/
+
+# Cloned transcript source data (external repo)
+transcripts/source/

@@ -8,10 +8,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from app.config import settings
 from app.db import Base, engine
-from app.routers import health
+from app.routers import health, chat
 
 # Import models so that Base.metadata knows about them before create_all
 import app.models  # noqa: F401
@@ -20,6 +21,10 @@ import app.models  # noqa: F401
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Create database tables on startup. In production, use Alembic migrations."""
+    # Enable pgvector extension before creating tables that use Vector columns
+    with engine.connect() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.commit()
     Base.metadata.create_all(bind=engine)
     yield
 
@@ -42,3 +47,5 @@ app.add_middleware(
 
 # Mount routers
 app.include_router(health.router)
+app.include_router(chat.router)
+
