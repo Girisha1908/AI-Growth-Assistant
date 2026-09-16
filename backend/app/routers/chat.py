@@ -1,18 +1,20 @@
 """Chat router implementing the RAG query endpoint.
 
 Takes user queries, retrieves relevant chunks from PostgreSQL via pgvector,
-constructs a grounded prompt, and calls Ollama's chat endpoint to synthesize
-a cited answer.
+constructs a grounded prompt, and calls the configured LLMProvider interface
+to synthesize a cited answer with session persistence.
 """
 
+import uuid
 from typing import Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-import requests
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session as DbSession
 
-from app.config import settings
+from app.config import get_llm_provider
 from app.db import get_db
+from app.models import Session, Message
+from app.providers.base import LLMProvider
 from app.retrieval import search_chunks
 
 router = APIRouter(tags=["chat"])
@@ -21,6 +23,7 @@ REFUSAL_MESSAGE = "I don't have enough information from the transcripts to answe
 
 
 class ChatRequest(BaseModel):
+    session_id: uuid.UUID
     message: str
 
 
@@ -35,8 +38,13 @@ class ChatResponse(BaseModel):
     error: Optional[str] = None
 
 
-def generate_rag_answer(question: str, chunks: list[dict]) -> tuple[str, Optional[str]]:
-    """Format prompt with retrieved context and invoke Ollama's chat API.
+async def generate_rag_answer(
+    question: str,
+    chunks: list[dict],
+    history: Optional[list[Message]] = None,
+    provider: Optional[LLMProvider] = None,
+) -> tuple[str, Optional[str]]:
+    """Format prompt with retrieved context and invoke the LLMProvider interface.
 
     Returns a tuple of (answer_text, error_message).
     """
@@ -66,60 +74,86 @@ def generate_rag_answer(question: str, chunks: list[dict]) -> tuple[str, Optiona
         "Answer based only on the context above:"
     )
 
-    url = f"{settings.OLLAMA_BASE_URL}/api/chat"
-    payload = {
-        "model": settings.OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        "stream": False,
-        "options": {
-            "temperature": 0.2,
-        },
-    }
+    # Construct chat messages list, including system prompt, previous conversation turns, and current query
+    messages = [{"role": "system", "content": system_prompt}]
+    if history:
+        for msg in history:
+            messages.append({"role": msg.role, "content": msg.content})
+    messages.append({"role": "user", "content": user_message})
 
+    llm = provider or get_llm_provider()
     try:
-        response = requests.post(url, json=payload, timeout=300)
-        response.raise_for_status()
-        data = response.json()
-        answer = data.get("message", {}).get("content", "").strip()
+        answer = await llm.chat(messages)
         if not answer:
             return REFUSAL_MESSAGE, "Empty response from LLM"
         return answer, None
-    except requests.exceptions.ConnectionError:
-        err = f"Cannot connect to Ollama at {url} — is the model server running?"
-        return REFUSAL_MESSAGE, err
-    except requests.exceptions.Timeout:
-        err = "Ollama generation timed out"
-        return REFUSAL_MESSAGE, err
     except Exception as e:
-        err = f"Ollama generation error: {e}"
-        return REFUSAL_MESSAGE, err
+        return REFUSAL_MESSAGE, str(e)
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat_endpoint(request: ChatRequest, db: Session = Depends(get_db)):
-    """Answer questions grounded in the podcast transcripts."""
-    user_query = request.message.strip()
+async def chat_endpoint(request: ChatRequest, db: DbSession = Depends(get_db)):
+    """Answer questions grounded in the podcast transcripts with session persistence."""
+    # 1. Validate session existence — return 404 if invalid
+    session = db.query(Session).filter(Session.id == request.session_id).first()
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {request.session_id} not found",
+        )
 
+    user_query = request.message.strip()
     if not user_query:
         return ChatResponse(
             answer="Please ask a question about growth, product management, or startups.",
             sources=[],
         )
 
-    # 1. Retrieve top matching chunks (k=3 provides rich context while keeping inference fast on local machines)
-    chunks = search_chunks(query=user_query, db=db, k=3)
+    # 2. Retrieve recent conversation history for this session (last 6 messages)
+    recent_messages = (
+        db.query(Message)
+        .filter(Message.session_id == request.session_id)
+        .order_by(Message.created_at.desc())
+        .limit(6)
+        .all()
+    )
+    history = list(reversed(recent_messages))
 
-    # 2. If no chunks pass the threshold, return structured refusal without LLM call
+    # 3. Inform retrieval using conversation context for follow-up questions
+    prior_user_queries = [m.content for m in history if m.role == "user"]
+    retrieval_query = (
+        f"{prior_user_queries[-1]} {user_query}" if prior_user_queries else user_query
+    )
+
+    chunks = search_chunks(query=retrieval_query, db=db, k=3)
+    if not chunks and prior_user_queries:
+        # Fallback to standalone user query if combined context had no matches
+        chunks = search_chunks(query=user_query, db=db, k=3)
+
+    # 4. Save user message to database
+    user_record = Message(
+        session_id=request.session_id,
+        role="user",
+        content=user_query,
+    )
+    db.add(user_record)
+    db.commit()
+
+    # 5. If no chunks pass the threshold, return refusal and persist assistant response
     if not chunks:
+        asst_record = Message(
+            session_id=request.session_id,
+            role="assistant",
+            content=REFUSAL_MESSAGE,
+        )
+        db.add(asst_record)
+        db.commit()
         return ChatResponse(
             answer=REFUSAL_MESSAGE,
             sources=[],
         )
 
-    # 3. Format actual source citations from retrieved chunks
+    # 6. Format source citations
     sources = [
         SourceCitation(
             source_file=c["source_file"],
@@ -128,18 +162,26 @@ def chat_endpoint(request: ChatRequest, db: Session = Depends(get_db)):
         for c in chunks
     ]
 
-    # 4. Synthesize answer with LLM
-    answer, error = generate_rag_answer(user_query, chunks)
+    # 7. Synthesize answer using the swappable LLMProvider interface
+    answer, error = await generate_rag_answer(user_query, chunks, history=history)
 
-    if error:
-        return ChatResponse(
-            answer=f"Retrieved {len(chunks)} relevant transcript chunks, but LLM generation failed: {error}",
-            sources=sources,
-            error=error,
-        )
+    final_answer = (
+        f"Retrieved {len(chunks)} relevant transcript chunks, but LLM generation failed: {error}"
+        if error
+        else answer
+    )
+
+    # 8. Save assistant response to database
+    asst_record = Message(
+        session_id=request.session_id,
+        role="assistant",
+        content=final_answer,
+    )
+    db.add(asst_record)
+    db.commit()
 
     return ChatResponse(
-        answer=answer,
+        answer=final_answer,
         sources=sources if answer != REFUSAL_MESSAGE else [],
-        error=None,
+        error=error,
     )

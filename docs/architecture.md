@@ -75,4 +75,44 @@ The system provides grounded question answering over the ingested podcast transc
    ```
    The citations returned reflect the actual files retrieved from PostgreSQL, preventing hallucinated citations.
 
+## Sessions & Persistence
+
+The chat system maintains multi-turn conversation context backed by PostgreSQL:
+
+1. **Session Lifecycle (`sessions` table)**:
+   - Clients create a session via `POST /sessions`, which generates a UUID primary key and timestamp.
+   - `POST /chat` requires a valid `session_id` in the request body (`{"session_id": "uuid", "message": "string"}`). If an invalid or unknown UUID is supplied, the endpoint immediately returns HTTP 404 without creating orphan sessions.
+
+2. **Message Storage (`messages` table)**:
+   - Each interaction persists two rows linked to `session_id`: the user's prompt (`role="user"`) and the assistant's synthesized answer (`role="assistant"`).
+   - Foreign key constraint with `ON DELETE CASCADE` ensures child messages are automatically removed when a parent session is deleted.
+   - Clients can retrieve full chronological history for any session via `GET /sessions/{session_id}/messages`.
+
+3. **Multi-Turn Context Resolution**:
+   - **Retrieval Context**: For follow-up questions that depend on prior context (e.g., "What about specifically in the first week?" following a question on user retention), previous user queries are combined with the current query to ensure semantic vector search retrieves relevant chunks.
+   - **Prompt History**: The last $N$ messages (default 6) are fetched from PostgreSQL and prepended to the prompt payload before the current grounded snippets, enabling natural follow-up dialogue while keeping token usage bounded.
+
+## Model Provider Toggle
+
+The application decouples generation logic from specific LLM backends using an extensible provider pattern:
+
+1. **`LLMProvider` Interface**:
+   - Defined in `backend/app/providers/base.py` as an abstract base class with a single method:
+     ```python
+     async def chat(self, messages: list[dict]) -> str: ...
+     ```
+   - Standardizes communication so that routers never invoke provider-specific SDKs or HTTP URLs directly.
+
+2. **Supported Providers**:
+   - **Ollama (`OllamaProvider`)**: Local inference against Ollama's `/api/chat` (e.g., `llama3.2:3b`).
+   - **Claude (`ClaudeProvider`)**: Remote inference against Anthropic's Messages API (`https://api.anthropic.com/v1/messages`). Requires `ANTHROPIC_API_KEY`; validates key configuration on instantiation rather than import.
+
+   > [!NOTE]
+   > **Cloud provider (Claude)**: Implemented against the Anthropic Messages API via `ClaudeProvider` (`backend/app/providers/claude_provider.py`). Verified at the code level — imports cleanly without a key, and raises a clear `ValueError` when instantiated without `ANTHROPIC_API_KEY` set (see `backend/app/scripts/` or test output in the agent transcripts for this verification). Live end-to-end generation via Claude was not tested in this environment, since provisioning a billed API key was out of scope for the take-home's time budget. The provider abstraction (`LLMProvider` interface) is identical for both providers, so swapping in a real key and setting `LLM_PROVIDER=claude` requires zero code changes — this is demonstrated by the local Ollama provider working through the exact same interface.
+
+3. **Factory & Configuration**:
+   - `get_llm_provider()` in `backend/app/config.py` inspects `settings.LLM_PROVIDER` (`"ollama"` or `"claude"`) and returns the appropriate instance.
+   - Switching providers requires zero code changes — simply update `LLM_PROVIDER` in `.env` (and ensure `ANTHROPIC_API_KEY` is provided if choosing Claude).
+   - `GET /health` reports the currently active provider in its JSON payload.
+
 

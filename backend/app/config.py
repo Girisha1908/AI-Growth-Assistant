@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # Embedding model is configured separately from the chat model
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
     ANTHROPIC_API_KEY: Optional[str] = None
+    CLAUDE_MODEL: str = "claude-3-5-sonnet-20241022"
 
     # API Configuration
     CORS_ORIGINS: list[str] = [
@@ -40,3 +41,21 @@ class Settings(BaseSettings):
 
 # Global settings singleton instance
 settings = Settings()
+
+
+def get_llm_provider(provider_name: Optional[str] = None):
+    """Factory function returning the configured LLMProvider instance.
+
+    Inspects LLM_PROVIDER ('ollama' or 'claude') and instantiates the chosen provider.
+    """
+    selected = (provider_name or settings.LLM_PROVIDER).lower().strip()
+    if selected == "ollama":
+        from app.providers.ollama_provider import OllamaProvider
+        return OllamaProvider()
+    elif selected == "claude":
+        from app.providers.claude_provider import ClaudeProvider
+        return ClaudeProvider()
+    else:
+        raise ValueError(
+            f"Unsupported LLM provider '{selected}'. Supported providers are: 'ollama', 'claude'."
+        )

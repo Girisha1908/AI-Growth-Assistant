@@ -76,6 +76,36 @@ The ingestion pipeline clones Lenny's Podcast transcripts, chunks them, embeds t
 
 4. **Re-running** is safe — the script deletes existing chunks per source file before re-inserting (no duplicates).
 
+## Local and Cloud Model Setup
+
+The Lenny Growth Assistant features a swappable LLM provider abstraction layer (`LLMProvider`) supporting both local inference via Ollama and cloud inference via Anthropic Claude:
+
+### Option 1: Local Ollama (Default)
+Runs locally on your machine with zero cloud API costs:
+1. Ensure Ollama is running on your host with both the embedding and chat models pulled:
+   ```bash
+   ollama pull nomic-embed-text
+   ollama pull llama3.2:3b
+   ```
+2. In `.env`:
+   ```env
+   LLM_PROVIDER=ollama
+   OLLAMA_MODEL=llama3.2:3b
+   ```
+
+### Option 2: Cloud Claude (Anthropic)
+To evaluate or run the assistant using Anthropic Claude:
+1. Add your Anthropic API key and switch the provider in `.env`:
+   ```env
+   ANTHROPIC_API_KEY=sk-ant-api03-...
+   LLM_PROVIDER=claude
+   ```
+2. Restart the API service (zero code changes required):
+   ```bash
+   docker compose restart api
+   ```
+3. Verify `http://localhost:8000/health` reports `"provider": "claude"`. All subsequent `/chat` queries will run via Claude through the unified provider interface.
+
 ## Architecture
 
 ```
@@ -85,14 +115,16 @@ The ingestion pipeline clones Lenny's Podcast transcripts, chunks them, embeds t
 │  :5173       │     │  :8000       │     │  :5432              │
 └──────────────┘     └──────────────┘     └─────────────────────┘
                             │
-                      ┌─────▼─────┐
-                      │  Ollama   │
-                      │ (embed)   │
-                      │ :11434    │
-                      └───────────┘
+                      ┌─────▼─────────────────────────┐
+                      │      LLMProvider Layer        │
+                      │ ┌──────────────┬────────────┐ │
+                      │ │    Ollama    │   Claude   │ │
+                      │ │(llama3.2:3b) │ (Messages) │ │
+                      │ └──────────────┴────────────┘ │
+                      └───────────────────────────────┘
 ```
 
-See [docs/architecture.md](docs/architecture.md) for details on the ingestion pipeline.
+See [docs/architecture.md](docs/architecture.md) for details on the ingestion pipeline, session persistence, and provider toggle.
 
 ## Project Structure
 
@@ -104,13 +136,21 @@ See [docs/architecture.md](docs/architecture.md) for details on the ingestion pi
 │   ├── requirements.txt
 │   └── app/
 │       ├── main.py       # FastAPI app + CORS + lifespan
-│       ├── config.py     # Pydantic Settings (single source of truth)
+│       ├── config.py     # Pydantic Settings & get_llm_provider factory
 │       ├── db.py         # SQLAlchemy engine + session
 │       ├── models.py     # ORM models (sessions, messages, chunks)
+│       ├── retrieval.py  # pgvector similarity search & threshold gating
+│       ├── providers/    # Swappable LLMProvider abstraction
+│       │   ├── base.py
+│       │   ├── ollama_provider.py
+│       │   └── claude_provider.py
 │       ├── routers/
-│       │   └── health.py # Health check + chunk stats endpoints
+│       │   ├── health.py   # Health check & chunk stats endpoints
+│       │   ├── chat.py     # Grounded RAG chat endpoint
+│       │   └── sessions.py # Session creation & history endpoints
 │       └── scripts/
-│           └── ingest.py # Transcript ingestion pipeline
+│           ├── ingest.py        # Transcript ingestion pipeline
+│           └── test_sessions.py # Multi-turn session verification script
 ├── frontend/
 │   ├── Dockerfile
 │   ├── package.json
@@ -118,7 +158,8 @@ See [docs/architecture.md](docs/architecture.md) for details on the ingestion pi
 │       ├── App.jsx       # Fetches /health and displays status
 │       └── index.css
 ├── docs/
-│   └── architecture.md   # Architecture documentation
+│   ├── architecture.md   # Architecture documentation
+│   └── prd.md            # Product requirements & scope documentation
 └── transcripts/
     └── source/           # Cloned transcript repo (gitignored)
 ```
@@ -130,11 +171,11 @@ docker compose down           # Stop containers
 docker compose down -v        # Stop and remove volumes (deletes DB data)
 ```
 
-## What's Next
+## Progress
 
-- [ ] Chat endpoints and session management
+- [x] Chat endpoints and session management
 - [x] Transcript ingestion pipeline
-- [ ] RAG with pgvector similarity search
-- [ ] LLM provider integration (Ollama / Anthropic)
+- [x] RAG with pgvector similarity search
+- [x] LLM provider integration (Ollama / Anthropic)
 - [ ] Alembic database migrations
 
