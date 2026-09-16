@@ -115,4 +115,32 @@ The application decouples generation logic from specific LLM backends using an e
    - Switching providers requires zero code changes — simply update `LLM_PROVIDER` in `.env` (and ensure `ANTHROPIC_API_KEY` is provided if choosing Claude).
    - `GET /health` reports the currently active provider in its JSON payload.
 
+## Ship 30 Content Skill
+
+The application provides a dedicated content generation skill via `POST /skills/ship30`. 
+
+### Difference from Base `/chat` Endpoint
+While the `/chat` endpoint performs conversational question-answering over retrieved chunks, `POST /skills/ship30` is an opinionated ghostwriting engine. Rather than producing short conversational responses, it synthesizes retrieved podcast transcripts into an essay following the **Ship 30 for 30** online writing methodology developed by Dickie Bush and Nicolas Cole.
+
+Like `/chat`, the skill is fully integrated into the session lifecycle:
+- Accepts `session_id` and `topic`.
+- Validates session existence (404 on invalid UUID).
+- Reuses the existing semantic retrieval pipeline (`search_chunks` from `retrieval.py`).
+- Persists both the user prompt and the generated essay in the `messages` table.
+- Employs the swappable `LLMProvider` abstraction.
+
+### Encoded Writing Principles
+The skill encodes concrete, visible principles in `backend/app/skills/ship30.py`:
+1. **The Hook (Lead-In)**: Opens with a punchy, 1-2 sentence declarative hook that creates curiosity and answers *Who is this for? What is this about? Why should I care right now?*
+2. **"For WHO / SO THAT" Framework**: Immediately establishes the specific target persona and the promised tangible outcome.
+3. **High Rate of Revelation (RoR)**: High information density with zero fluff, filler phrases, or passive preambles.
+4. **1-3-1 Visual Cadence**: Structures points using rhythmic alternation: 1 punchy line, 3-sentence body or 3 bullets, 1 punchy conclusion.
+5. **Skimmable Visual Architecture**: Narrative-driven markdown subheadings (`##` / `###`), bolded opening words of key insights, and high-density bulleted lists.
+6. **Strict Transcript Grounding**: Anchors claims, heuristics, and quotes exclusively in verified transcripts from Lenny's Podcast.
+7. **Actionable Takeaway**: Concludes with a concrete implementation heuristic rather than an abstract summary.
+
+> [!NOTE]
+> **Word Count & Local Model Behavior**:
+> The prompt targets an in-depth ~1,250-word essay. In local CPU environments running `llama3.2:3b`, the model typically synthesizes high-density essays of ~600 words due to compact 3B instruct-tuning priors. Larger cloud models (such as Claude 3.5 Sonnet) expand to the full ~1,250-word target through the identical `LLMProvider` interface.
+
 

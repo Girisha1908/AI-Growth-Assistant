@@ -16,7 +16,7 @@ class OllamaProvider(LLMProvider):
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         temperature: float = 0.2,
-        timeout: int = 300,
+        timeout: int = 600,
     ):
         self.base_url = (base_url or settings.OLLAMA_BASE_URL).rstrip("/")
         self.model = model or settings.OLLAMA_MODEL

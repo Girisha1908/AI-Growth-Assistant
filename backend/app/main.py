@@ -12,7 +12,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.db import Base, engine
-from app.routers import health, chat, sessions
+from app.routers import health, chat, sessions, skills
 
 # Import models so that Base.metadata knows about them before create_all
 import app.models  # noqa: F401
@@ -49,4 +49,5 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(sessions.router)
+app.include_router(skills.router)
 
