@@ -1,4 +1,6 @@
 fastapi==0.115.6
+# Pinned: the Claude Agent SDK pulls in newer starlette unless constrained.
+starlette>=0.40,<0.42
 uvicorn[standard]==0.32.1
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.10
@@ -6,3 +8,7 @@ pydantic-settings==2.6.1
 python-dotenv==1.0.1
 pgvector==0.3.6
 requests==2.32.3
+PyYAML==6.0.2
+# Optional cloud agent path (LLM_PROVIDER=claude-agent). Safe to keep installed
+# when unused: it is imported lazily.
+claude-agent-sdk==0.2.165

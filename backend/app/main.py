@@ -1,53 +1,42 @@
-"""FastAPI application entry point.
-
-Creates tables on startup (suitable for early development — replace with
-Alembic migrations once the schema stabilizes).
-"""
+"""FastAPI entry point."""
 
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
 
+import app.models  # noqa: F401  (register tables on Base.metadata)
 from app.config import settings
-from app.db import Base, engine
-from app.routers import health, chat, sessions, skills
+from app.db import engine
+from app.errors import install_error_handlers
+from app.logging_utils import RequestLogMiddleware, configure_logging, get_logger
+from app.migrate import init_db
+from app.routers import chat, client_events, episodes, health, notes, profile, search, sessions, skills
 
-# Import models so that Base.metadata knows about them before create_all
-import app.models  # noqa: F401
+configure_logging(settings.LOG_LEVEL)
+log = get_logger("startup")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Create database tables on startup. In production, use Alembic migrations."""
-    # Enable pgvector extension before creating tables that use Vector columns
-    with engine.connect() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        conn.commit()
-    Base.metadata.create_all(bind=engine)
+    # Resilience: if the DB is briefly unavailable the API still starts; /health
+    # reports "degraded" and requests return a structured 503 instead of crashing.
+    try:
+        init_db(engine)
+    except Exception as e:  # noqa: BLE001
+        log.error("startup_db_unavailable", extra={"error": str(e)[:300]})
+    log.info("startup", extra={"provider": settings.LLM_PROVIDER, "embed": settings.embed_tag})
     yield
 
 
-app = FastAPI(
-    title="Lenny Growth Assistant API",
-    description="Backend API for the Lenny Growth Assistant — a RAG-powered podcast chat app.",
-    version="0.1.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="Lenny Growth Assistant API",
+              description="Grounded Q&A, Ship 30 essays and artifacts over Lenny's Podcast.",
+              version="1.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=settings.CORS_ORIGINS, allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"], expose_headers=["x-request-id"])
+app.add_middleware(RequestLogMiddleware)
+install_error_handlers(app)
 
-# CORS — allow the Vite dev server and common local origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Mount routers
-app.include_router(health.router)
-app.include_router(chat.router)
-app.include_router(sessions.router)
-app.include_router(skills.router)
-
+for r in (health.router, chat.router, sessions.router, skills.router, episodes.router,
+          notes.router, profile.router, search.router, client_events.router):
+    app.include_router(r)

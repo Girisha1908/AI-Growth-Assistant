@@ -18,6 +18,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy backend application source code
 COPY app/ ./app/
+COPY tests/ ./tests/
+COPY pytest.ini requirements-dev.txt ./
 
 # Expose backend API port
 EXPOSE 8000

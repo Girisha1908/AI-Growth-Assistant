@@ -51,3 +51,15 @@ Thumbs.db
 
 # Cloned transcript source data (external repo)
 transcripts/source/
+
+# Frontend build output
+frontend/dist/
+
+# Local eval output
+eval/last_run.md
+
+# Local ingestion log (large, machine-specific)
+transcripts/ingest.log
+
+# Brag render scratch (frames, stems)
+brag-output/work/

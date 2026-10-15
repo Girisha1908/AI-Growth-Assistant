@@ -1,328 +1,174 @@
 """Transcript ingestion pipeline.
 
-Run via: python -m app.scripts.ingest  (from the backend container)
-Or:      docker compose exec api python -m app.scripts.ingest
+    docker compose exec api python -m app.scripts.ingest              # everything (resumable)
+    docker compose exec api python -m app.scripts.ingest --limit 20   # a slice
+    docker compose exec api python -m app.scripts.ingest --dry-run    # parse+chunk only, no Ollama
+    docker compose exec api python -m app.scripts.ingest --force      # re-embed everything
 
-This script:
-1. Clones the Lenny's Podcast transcript repo (if not already present)
-2. Walks all episode transcript markdown files
-3. Chunks each transcript into ~500-token pieces with ~50-token overlap
-4. Embeds each chunk using Ollama's nomic-embed-text model
-5. Stores (source_file, chunk_index, content, embedding) in the chunks table
+Per episode (atomic -- all chunks or none):
+  1. parse YAML header  -> `episodes` row (guest, title, YouTube URL, date, ...)
+  2. split into chunks  -> ~500 words, 50 overlap, with the timestamp of each chunk
+  3. embed in batches   -> Ollama /api/embed
+  4. replace the episode's chunks in one transaction (so re-runs never duplicate)
 
-Idempotency: For each source file, existing chunks are deleted before
-re-inserting. This means re-running the script produces a clean result
-even if chunking logic changes — no silent duplicates.
+Resumable: an episode whose chunks were already embedded with the CURRENT
+embedding setup is skipped, so you can stop (Ctrl+C) and re-run any time.
 """
 
 import argparse
-import glob
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-import requests
-from sqlalchemy import text
+from sqlalchemy import func
 
 from app.config import settings
-from app.db import SessionLocal, engine, Base
-from app.models import Chunk
+from app.db import SessionLocal, engine
+from app.embeddings import EmbeddingError, embed_documents
+from app.ingestion.parsing import (chunk_paragraphs, normalize_meta, parse_frontmatter,
+                                   split_paragraphs)
+from app.migrate import init_db
+from app.models import Chunk, Episode
 
-# ── Constants ────────────────────────────────────────────────────────
 TRANSCRIPT_REPO = "https://github.com/ChatPRD/lennys-podcast-transcripts.git"
-TRANSCRIPTS_DIR = Path("/app/transcripts/source")
-EPISODES_GLOB = "episodes/*/transcript.md"
-
-# Chunking parameters (in approximate word/token counts)
-CHUNK_SIZE = 500    # target tokens per chunk
-CHUNK_OVERLAP = 50  # overlap tokens between consecutive chunks
 
 
-def ensure_repo_cloned():
-    """Clone the transcript repo if it doesn't exist or is empty."""
-    if TRANSCRIPTS_DIR.exists() and any(TRANSCRIPTS_DIR.iterdir()):
-        print(f"✓ Transcript repo already exists at {TRANSCRIPTS_DIR}")
+def ensure_repo(path: Path) -> None:
+    if path.exists() and any(path.iterdir()):
+        print(f"✓ Transcript repo found at {path}")
         return
-
-    print(f"Cloning transcript repo into {TRANSCRIPTS_DIR}...")
-    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["git", "clone", "--depth", "1", TRANSCRIPT_REPO, str(TRANSCRIPTS_DIR)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(f"✗ git clone failed: {result.stderr}", file=sys.stderr)
+    print(f"Cloning transcript repo into {path} ...")
+    path.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["git", "clone", "--depth", "1", TRANSCRIPT_REPO, str(path)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"✗ git clone failed: {r.stderr}", file=sys.stderr)
         sys.exit(1)
-    print("✓ Transcript repo cloned successfully")
+    print("✓ Cloned")
 
 
-def parse_transcript(filepath: Path) -> str:
-    """Parse a transcript markdown file into body text, stripping YAML frontmatter.
-
-    Files use YAML frontmatter between --- delimiters, followed by the
-    transcript content.
-    """
-    content = filepath.read_text(encoding="utf-8")
-    parts = content.split("---", 2)
-
-    if len(parts) >= 3:
-        # parts[0] is empty (before first ---), parts[1] is frontmatter, parts[2] is body
-        body = parts[2].strip()
-    else:
-        # No frontmatter, treat entire file as body
-        body = content.strip()
-
-    return body
+def prepare_episode(file: Path, root: Path) -> dict:
+    """Parse + chunk one transcript. Pure CPU work; no DB, no network."""
+    slug = file.parent.name
+    meta, body = parse_frontmatter(file.read_text(encoding="utf-8"))
+    pieces = chunk_paragraphs(split_paragraphs(body), settings.CHUNK_WORDS,
+                              settings.CHUNK_OVERLAP_WORDS)
+    return {"slug": slug, "source_file": file.relative_to(root).as_posix(),
+            "meta": normalize_meta(meta, slug), "pieces": pieces}
 
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split text into chunks of approximately `chunk_size` tokens with `overlap`.
-
-    Strategy: Split on paragraph boundaries (double newlines), then greedily
-    combine paragraphs until we reach the token target. Uses word count as a
-    rough token estimate (close enough for English text).
-    """
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-
-    if not paragraphs:
-        return []
-
-    chunks = []
-    current_words = []
-    current_count = 0
-
-    for para in paragraphs:
-        para_words = para.split()
-        para_count = len(para_words)
-
-        # If adding this paragraph exceeds the target and we already have content,
-        # save the current chunk and start a new one with overlap
-        if current_count + para_count > chunk_size and current_count > 0:
-            chunks.append(" ".join(current_words))
-
-            # Keep the last `overlap` words for context continuity
-            if overlap > 0 and len(current_words) > overlap:
-                current_words = current_words[-overlap:]
-                current_count = len(current_words)
-            else:
-                current_words = []
-                current_count = 0
-
-        current_words.extend(para_words)
-        current_count += para_count
-
-    # Don't forget the last chunk
-    if current_words:
-        chunks.append(" ".join(current_words))
-
-    return chunks
+def is_up_to_date(db, source_file: str) -> bool:
+    ep = db.query(Episode).filter(Episode.source_file == source_file).first()
+    if not ep or ep.chunk_count == 0:
+        return False
+    stale = (db.query(func.count(Chunk.id))
+             .filter(Chunk.source_file == source_file,
+                     (Chunk.embed_model.is_(None)) | (Chunk.embed_model != settings.embed_tag))
+             .scalar())
+    return stale == 0
 
 
-def get_embedding(text: str) -> list[float] | None:
-    """Call Ollama's embedding API to get a vector for the given text.
-
-    Returns None if the call fails (network error, Ollama not running, etc.).
-    """
-    url = f"{settings.OLLAMA_BASE_URL}/api/embed"
-    try:
-        response = requests.post(
-            url,
-            json={"model": settings.OLLAMA_EMBED_MODEL, "input": text},
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
-        embeddings = data.get("embeddings")
-        if embeddings and len(embeddings) > 0:
-            return embeddings[0]
-        embedding = data.get("embedding")
-        if embedding:
-            return embedding
-        print(f"  ⚠ Unexpected response format: {list(data.keys())}")
-        return None
-    except requests.exceptions.ConnectionError:
-        print(f"  ✗ Cannot connect to Ollama at {url} — is it running?")
-        return None
-    except requests.exceptions.Timeout:
-        print(f"  ✗ Ollama request timed out")
-        return None
-    except Exception as e:
-        print(f"  ✗ Embedding error: {e}")
-        return None
+def store_episode(db, prepared: dict, vectors: list[list[float]]) -> None:
+    """Replace an episode's chunks atomically."""
+    db.query(Chunk).filter(Chunk.source_file == prepared["source_file"]).delete()
+    ep = db.query(Episode).filter(Episode.slug == prepared["slug"]).first()
+    if ep is None:
+        ep = Episode(slug=prepared["slug"], source_file=prepared["source_file"],
+                     title=prepared["meta"]["title"])
+        db.add(ep)
+    for k, v in prepared["meta"].items():
+        setattr(ep, k, v)
+    ep.source_file = prepared["source_file"]
+    db.flush()
+    for piece, vec in zip(prepared["pieces"], vectors):
+        db.add(Chunk(episode_id=ep.id, source_file=prepared["source_file"],
+                     chunk_index=piece.index, content=piece.text,
+                     start_seconds=piece.start_seconds, embedding=vec,
+                     embed_model=settings.embed_tag))
+    ep.chunk_count = len(prepared["pieces"])
+    db.commit()
 
 
-def ingest(limit: int | None = None, offset: int = 0, skip_existing: bool = False):
-    """Main ingestion pipeline."""
-    print("=" * 60)
-    print("Lenny Growth Assistant — Transcript Ingestion")
-    print("=" * 60)
+def run(path: str, limit, offset: int, force: bool, dry_run: bool) -> int:
+    root = Path(path)
+    print("=" * 64 + "\nLenny Growth Assistant — transcript ingestion\n" + "=" * 64)
+    ensure_repo(root)
+    files = sorted(root.glob("episodes/*/transcript.md"))
+    if not files:
+        print(f"✗ No transcripts under {root}/episodes/*/transcript.md", file=sys.stderr)
+        return 1
+    total = len(files)
+    files = files[offset:]
+    if limit:
+        files = files[:limit]
+    print(f"Episodes available: {total} | this run: {len(files)} (offset={offset}, limit={limit})")
+    print(f"Embedding: {settings.embed_tag} via {settings.OLLAMA_BASE_URL} "
+          f"(batch={settings.EMBED_BATCH_SIZE}){'  [DRY RUN]' if dry_run else ''}\n")
 
-    # Step 1: Ensure transcripts are available
-    ensure_repo_cloned()
+    if not dry_run:
+        init_db(engine)
+        try:
+            embed_documents(["connectivity check"])
+        except EmbeddingError as e:
+            print(f"✗ {e}\n  Start Ollama and run: ollama pull {settings.OLLAMA_EMBED_MODEL}",
+                  file=sys.stderr)
+            return 2
 
-    # Enable pgvector extension (in case this runs before the API server)
-    with engine.connect() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        conn.commit()
-
-    # Ensure tables exist
-    Base.metadata.create_all(bind=engine)
-
-    # Step 2: Find all transcript files
-    pattern = str(TRANSCRIPTS_DIR / EPISODES_GLOB)
-    transcript_files = sorted(glob.glob(pattern))
-
-    if not transcript_files:
-        print(f"✗ No transcript files found matching {pattern}")
-        print("  Check that the repo was cloned correctly.")
-        sys.exit(1)
-
-    total_available = len(transcript_files)
-    if offset > 0:
-        transcript_files = transcript_files[offset:]
-
-    if limit is not None and limit > 0:
-        transcript_files = transcript_files[:limit]
-        print(f"\nFound {total_available} transcript files (processing {len(transcript_files)} files, offset={offset}, limit={limit})")
-    else:
-        print(f"\nFound {total_available} transcript files (processing {len(transcript_files)} files, offset={offset})")
-
-    print(f"Embedding model: {settings.OLLAMA_EMBED_MODEL}")
-    print(f"Ollama URL: {settings.OLLAMA_BASE_URL}")
-    print()
-
-    total_chunks = 0
-    skipped_chunks = 0
-    successful_episodes = 0
-    failed_episodes = 0
-    start_time = time.time()
-
+    stats = {"done": 0, "skipped": 0, "failed": 0, "chunks": 0}
+    start = time.time()
     db = SessionLocal()
     try:
-        for file_idx, filepath_str in enumerate(transcript_files, 1):
-            filepath = Path(filepath_str)
-            relative_path = str(filepath.relative_to(TRANSCRIPTS_DIR))
-
-            try:
-                # If skip_existing is enabled and chunks already exist, skip
-                if skip_existing:
-                    exists = db.query(Chunk.id).filter(Chunk.source_file == relative_path).first()
-                    if exists:
-                        print(f"  [{file_idx}/{len(transcript_files)}] {relative_path} — already in DB, skipping")
-                        continue
-
-                # Step 3: Parse and chunk
-                body = parse_transcript(filepath)
-                if not body:
-                    print(f"  [{file_idx}/{len(transcript_files)}] {relative_path} — empty, skipping")
-                    continue
-
-                chunks = chunk_text(body)
-                if not chunks:
-                    print(f"  [{file_idx}/{len(transcript_files)}] {relative_path} — no chunks, skipping")
-                    continue
-
-                # Idempotency: delete existing chunks for this source file
-                db.query(Chunk).filter(Chunk.source_file == relative_path).delete()
-                db.flush()
-
-                file_chunk_count = 0
-                for chunk_idx, chunk_content in enumerate(chunks):
-                    # Step 4: Embed
-                    embedding = get_embedding(chunk_content)
-                    if embedding is None:
-                        skipped_chunks += 1
-                        continue
-
-                    # Step 5: Store
-                    chunk = Chunk(
-                        source_file=relative_path,
-                        chunk_index=chunk_idx,
-                        content=chunk_content,
-                        embedding=embedding,
-                    )
-                    db.add(chunk)
-                    file_chunk_count += 1
-
-                db.commit()
-                total_chunks += file_chunk_count
-                successful_episodes += 1
-
-            except Exception as file_err:
-                db.rollback()
-                failed_episodes += 1
-                print(f"  ⚠ Error processing {relative_path}: {file_err}. Skipping file.", file=sys.stderr)
+        for i, file in enumerate(files, 1):
+            prepared = prepare_episode(file, root)
+            n = len(prepared["pieces"])
+            if dry_run:
+                stats["done"] += 1
+                stats["chunks"] += n
+                if i <= 3:
+                    print(f"  {prepared['slug']}: {n} chunks | {prepared['meta']['guest']}")
                 continue
-
-            # Step 6: Periodic progress logging (every 5 episodes or on final episode)
-            if file_idx % 5 == 0 or file_idx == len(transcript_files):
-                elapsed = time.time() - start_time
-                print(
-                    f"[Progress] Processed {file_idx}/{len(transcript_files)} episodes, "
-                    f"{total_chunks} chunks stored so far (Elapsed: {elapsed:.0f}s)"
-                )
-
+            if not force and is_up_to_date(db, prepared["source_file"]):
+                stats["skipped"] += 1
+                continue
+            try:
+                vectors = embed_documents([p.text for p in prepared["pieces"]])
+                store_episode(db, prepared, vectors)
+                stats["done"] += 1
+                stats["chunks"] += n
+            except Exception as e:  # noqa: BLE001 - one bad episode must not stop the run
+                db.rollback()
+                stats["failed"] += 1
+                print(f"  ✗ {prepared['slug']}: {e}", file=sys.stderr)
+            if i % 5 == 0 or i == len(files):
+                elapsed = time.time() - start
+                working = stats["done"] + stats["failed"]
+                eta = (elapsed / working) * (len(files) - i) if working else 0
+                print(f"[{i}/{len(files)}] done={stats['done']} skipped={stats['skipped']} "
+                      f"failed={stats['failed']} chunks={stats['chunks']} "
+                      f"elapsed={elapsed:.0f}s eta≈{eta/60:.0f}min", flush=True)
     except KeyboardInterrupt:
-        print("\n\n⚠ Interrupted! Committing progress so far...")
-        db.commit()
-    except Exception as e:
-        print(f"\n✗ Fatal pipeline error: {e}")
-        db.rollback()
-        raise
+        print("\nInterrupted — safe to re-run; finished episodes are kept.")
     finally:
         db.close()
 
-    elapsed = time.time() - start_time
-    print()
-    print("=" * 60)
-    print(f"✓ Ingestion complete!")
-    print(f"  Episodes requested:  {len(transcript_files)}")
-    print(f"  Episodes succeeded:  {successful_episodes}")
-    if failed_episodes > 0:
-        print(f"  Episodes failed:     {failed_episodes} (skipped)")
-    print(f"  Chunks stored:       {total_chunks}")
-    print(f"  Chunks skipped:      {skipped_chunks} (embedding failures)")
-    print(f"  Time elapsed:        {elapsed:.1f}s")
-    print("=" * 60)
+    print("\n" + "=" * 64)
+    print(f"Done: {stats['done']} | skipped (up to date): {stats['skipped']} | "
+          f"failed: {stats['failed']} | chunks written: {stats['chunks']}")
+    print("Check: curl http://localhost:8000/health/chunks")
+    return 0 if stats["failed"] == 0 else 3
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Ingest Lenny's Podcast transcripts into PostgreSQL with pgvector."
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Maximum number of episode transcripts to ingest (default: all, or INGEST_LIMIT env var).",
-    )
-    parser.add_argument(
-        "--offset",
-        type=int,
-        default=0,
-        help="Starting episode index offset (default: 0).",
-    )
-    parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip episodes that already have chunks stored in the database.",
-    )
-    args = parser.parse_args()
-
-    limit = args.limit
-    if limit is None and "INGEST_LIMIT" in os.environ:
-        try:
-            limit = int(os.environ["INGEST_LIMIT"])
-        except ValueError:
-            print(f"⚠ Invalid INGEST_LIMIT '{os.environ['INGEST_LIMIT']}', ignoring.", file=sys.stderr)
-
-    ingest(limit=limit, offset=args.offset, skip_existing=args.skip_existing)
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Ingest Lenny's Podcast transcripts")
+    ap.add_argument("--path", default=settings.TRANSCRIPTS_DIR, help="transcript repo directory")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--offset", type=int, default=0)
+    ap.add_argument("--force", action="store_true", help="re-embed even if up to date")
+    ap.add_argument("--dry-run", action="store_true", help="parse and chunk only (no Ollama/DB)")
+    a = ap.parse_args()
+    sys.exit(run(a.path, a.limit, a.offset, a.force, a.dry_run))
 
 
 if __name__ == "__main__":
     main()
-
-

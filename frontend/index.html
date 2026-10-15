@@ -1,10 +1,18 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Lenny Growth Assistant</title>
-    <meta name="description" content="Health status dashboard for the Lenny Growth Assistant API" />
+    <meta name="description" content="Grounded answers, Ship 30 essays and artifacts from Lenny's Podcast transcripts." />
+    <!-- set the theme before first paint (no flash) -->
+    <script>
+      try {
+        var t = localStorage.getItem('lga-theme') ||
+          (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+        document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

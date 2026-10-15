@@ -1,32 +1,28 @@
-"""Base interface for swappable LLM providers.
+"""The one interface every model backend must satisfy.
 
-Defines the contract that all LLM implementations (Ollama, Claude, etc.)
-must satisfy to be used interchangeably by the /chat endpoint.
+Application code (agent, skills, routers) imports ONLY this. Which concrete
+class sits behind it is decided by config -- that is what makes the model
+toggle real rather than cosmetic.
 """
 
 from abc import ABC, abstractmethod
 
 
 class LLMProvider(ABC):
-    """Abstract interface that all LLM providers must implement.
-
-    Any provider (Ollama, Claude, etc.) must expose an asynchronous chat
-    method accepting standard role/content messages and returning the
-    assistant's synthesized text response.
-    """
+    name: str = "base"
+    model: str = ""
 
     @abstractmethod
     async def chat(self, messages: list[dict]) -> str:
-        """Send chat messages to the model provider and return the response text.
+        """messages: [{'role': 'system'|'user'|'assistant', 'content': str}, ...]
 
-        Args:
-            messages: List of message dictionaries with 'role' and 'content' keys.
-                      E.g., [{'role': 'system', 'content': ...}, {'role': 'user', 'content': ...}]
-
-        Returns:
-            The generated response string.
-
-        Raises:
-            Exception: If provider communication fails or returns an unrecoverable error.
+        Returns the assistant text. Raises:
+          ValueError       provider misconfigured (e.g. missing API key)
+          ConnectionError  provider unreachable
+          TimeoutError     provider too slow
+          RuntimeError     anything else
         """
-        pass
+
+    async def ping(self) -> dict:
+        """Cheap reachability check for /health. Never raises."""
+        return {"reachable": True}

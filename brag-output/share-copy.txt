@@ -1,0 +1,1 @@
+303 episodes of Lenny's Podcast, 4.6M words, and you can now ask them anything. Every answer cites the guest and the exact second on YouTube, and if the transcripts don't cover it, it says so instead of guessing. Runs fully on your laptop with Ollama: github.com/Girisha1908/AI-Growth-Assistant

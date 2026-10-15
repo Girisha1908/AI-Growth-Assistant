@@ -1,146 +1,125 @@
 # Architecture
 
-## Ingestion Pipeline
+## 1. System overview
 
-The ingestion pipeline is a one-off script (`python -m app.scripts.ingest`) that
-loads Lenny's Podcast transcripts into a vector-searchable format:
-
-1. **Source**: Transcripts are cloned from
-   [ChatPRD/lennys-podcast-transcripts](https://github.com/ChatPRD/lennys-podcast-transcripts)
-   into `transcripts/source/`. Each episode lives in `episodes/{guest-name}/transcript.md`
-   with YAML frontmatter (guest, title, YouTube URL, publish date) and the full
-   transcript body.
-
-2. **Chunking**: Each transcript is split into ~500-token chunks with ~50-token
-   overlap. The splitter is paragraph-aware — it breaks on `\n\n` boundaries and
-   combines paragraphs until hitting the token target. This prevents mid-sentence
-   cuts while keeping chunks small enough for embedding models.
-
-3. **Embedding**: Each chunk is sent to a local Ollama instance running
-   `nomic-embed-text`, which returns a 768-dimensional vector. The embedding call
-   is fault-tolerant — if Ollama is down or a chunk fails, the error is logged and
-   that chunk is skipped rather than crashing the pipeline.
-
-4. **Storage**: Chunks are stored in the `chunks` table in PostgreSQL with the
-   `pgvector` extension. Each row contains:
-   - `source_file`: relative path (e.g. `episodes/brian-chesky/transcript.md`)
-   - `chunk_index`: position within the file (0-indexed)
-   - `content`: the actual text
-   - `embedding`: 768-dim vector for similarity search
-
-5. **Traceability**: Every chunk retains its `source_file` and `chunk_index`, so
-   when a retrieval query finds a relevant chunk, the system can cite the exact
-   episode and approximate position within the transcript.
-
-6. **Idempotency**: Re-running the script deletes existing chunks for each source
-   file before re-inserting. This avoids duplicates and ensures the latest chunking
-   logic is reflected.
-
-## Ingestion Scope & Subset Choice
-
-For this phase, we ingested a representative subset of 100/303 episodes due to time constraints; architecture supports full ingestion via re-running the script with the cap removed:
-
-```bash
-# Ingest subset (e.g. 100 episodes)
-docker compose exec api python -m app.scripts.ingest --limit 100
-
-# Full catalog ingestion (all 303 episodes)
-docker compose exec api python -m app.scripts.ingest
+```
+┌────────────┐  HTTP/JSON   ┌───────────────────────────── FastAPI ─────────────────────────────┐
+│ React UI   │─────────────▶│ routers ─▶ agent runner ─▶ router (intent) ─▶ skill ─▶ LLMProvider │──▶ Ollama (local, default)
+│ (Vite,     │◀─────────────│     │           │                                                │──▶ Claude API / Agent SDK (opt-in)
+│  Tailwind) │  answer +    │     │           └─▶ retrieval (hybrid) ─▶ embeddings client ─────┼──▶ Ollama /api/embed
+└────────────┘  sources +   │     ▼                                                            │
+   sandboxed    artifact    │  PostgreSQL 16 + pgvector  (episodes, chunks, sessions, messages, │
+   iframe                   │                             profile, notes)                       │
+                            └──────────────────────────────────────────────────────────────────┘
 ```
 
-## Retrieval & Generation
+| Boundary | Responsibility | Never does |
+|---|---|---|
+| `routers/` | HTTP contracts, validation, persistence of turns | Prompting, retrieval SQL |
+| `agent/` | Intent routing, prompts, skills, orchestration | Talk to a specific model vendor |
+| `providers/` | One class per model backend behind `LLMProvider` | Retrieval, routing |
+| `retrieval.py`, `embeddings.py` | Search and vectors (same embedding model for docs and queries) | Generate answers |
+| `ingestion/`, `scripts/ingest.py` | Parse, chunk, embed, store transcripts | Serve requests |
+| `frontend/` | Rendering, sandboxing untrusted HTML | Business rules |
 
-The system provides grounded question answering over the ingested podcast transcripts via the `POST /chat` endpoint:
+## 2. Database schema
 
-1. **Query Embedding**: When a user submits a question (`{"message": "..."}`), the query text is sent to Ollama's `/api/embed` endpoint using `nomic-embed-text`, generating a 768-dimensional query vector matching the stored transcript chunks.
+| Table | Key columns | Notes |
+|---|---|---|
+| `episodes` | `id`, `slug` (unique), `guest`, `title`, `youtube_url`, `video_id`, `publish_date`, `duration_seconds`, `keywords` (json), `chunk_count` | One row per transcript header |
+| `chunks` | `id`, `episode_id` → episodes, `source_file`, `chunk_index`, `content`, `start_seconds`, `embedding vector(768)`, `embed_model`, `tsv tsvector` (generated) | Unique `(source_file, chunk_index)`. HNSW index on `embedding`, GIN on `tsv` |
+| `sessions` | `id`, `created_at`, `metadata` (json: user agent, client info) | One per chat. Contexts never mix |
+| `messages` | `id`, `session_id` → sessions (cascade), `role`, `content`, `mode`, `sources` (json), `artifact` (json), `meta` (json), `created_at` | Sources and artifact are stored with the assistant turn |
+| `profile` | `id` (always 1), `display_name`, `goal`, `background`, `known_concepts`, `updated_at` | Single-user learner profile |
+| `notes` | `id`, `title`, `kind` (note/markdown/html/answer), `content`, `sources`, `created_at` | The personal library |
 
-2. **Similarity Search (`<=>` Cosine Distance)**:
-   SQLAlchemy queries PostgreSQL with `pgvector`'s cosine distance operator (`Chunk.embedding.cosine_distance(query_vector)`), ordering by distance ascending to fetch the top-k (default `k=5`) most relevant transcript passages.
+`app/migrate.py` upgrades an older database in place (adds columns/indexes only if missing; `lock_timeout` guards it). Alembic is the production answer and is listed under limits.
 
-3. **Relevance Thresholding**:
-   Cosine distance ranges from 0.0 (identical) to 2.0 (opposite). If the nearest chunk's distance exceeds `0.45` (equivalent to cosine similarity < 0.55), the query is determined to be outside the scope of the transcripts. The endpoint returns an honest refusal (`"I don't have enough information from the transcripts to answer that."`) with empty sources, bypassing the LLM call entirely.
+## 3. API
 
-4. **Prompt Construction**:
-   If relevant chunks are found, a strict grounding prompt is constructed with the retrieved transcript passages labeled by source file and chunk index. The prompt instructs the model to answer *only* using the provided context and to refuse to answer if the context is insufficient.
+All errors: `{"error": {"code", "message", "hint"}}`. Every response carries `x-request-id`.
 
-5. **Generation & Citation**:
-   The prompt is dispatched to Ollama's `/api/chat` endpoint (e.g., `llama3.1:8b`). The API returns a structured JSON response:
-   ```json
-   {
-     "answer": "...",
-     "sources": [
-       {"source_file": "episodes/archie-abrams/transcript.md", "chunk_index": 22}
-     ]
-   }
-   ```
-   The citations returned reflect the actual files retrieved from PostgreSQL, preventing hallucinated citations.
+| Method & path | Purpose |
+|---|---|
+| `POST /sessions` · `GET /sessions` · `GET /sessions/{id}/messages` · `DELETE /sessions/{id}` | Chats and history |
+| `POST /chat` | `{session_id, message, mode?, provider?, personalize?}` → `{answer, sources[], artifact?, meta}` |
+| `POST /skills/ship30` | Dedicated Ship 30 for 30 endpoint (same agent, `mode=ship30`) |
+| `POST /search` | Retrieval only (no model). Used by the eval harness |
+| `GET /episodes` · `GET /episodes/{id}` | Browse the knowledge base |
+| `GET/PUT /profile` · `GET/POST/DELETE /notes` | Personalisation and library |
+| `GET /health` · `GET /health/chunks` · `GET /config` | Real DB/provider checks, corpus stats, public settings |
+| `POST /client-events` | Frontend error reports (e.g. artifact render failures) |
 
-## Sessions & Persistence
+Modes: `auto` (default), `ask`, `explain`, `quiz`, `ship30`, `artifact`, `prd`.
 
-The chat system maintains multi-turn conversation context backed by PostgreSQL:
+## 4. Ingestion (load → chunk → index → refresh → trace)
 
-1. **Session Lifecycle (`sessions` table)**:
-   - Clients create a session via `POST /sessions`, which generates a UUID primary key and timestamp.
-   - `POST /chat` requires a valid `session_id` in the request body (`{"session_id": "uuid", "message": "string"}`). If an invalid or unknown UUID is supplied, the endpoint immediately returns HTTP 404 without creating orphan sessions.
+1. **Load**: `python -m app.scripts.ingest` clones `ChatPRD/lennys-podcast-transcripts` into `transcripts/source/` (gitignored; we don't vendor someone else's repo).
+2. **Parse**: YAML header → `episodes`; body split into paragraphs; the latest `(HH:MM:SS)` timestamp is carried forward.
+3. **Chunk**: paragraphs packed to about 500 words with 50 words of overlap; speaker labels kept; each chunk stores `start_seconds`.
+4. **Embed**: batches of 16 to Ollama `nomic-embed-text` (768 dims). Prefixes optional (`EMBED_USE_PREFIXES`, off by default because the threshold was calibrated without them).
+5. **Index**: per-episode atomic transaction (delete old chunks, insert new). Generated `tsv` and HNSW indexes make search fast.
+6. **Refresh**: re-run the script. Episodes already embedded with the current setup are skipped; `--force` re-embeds. `embed_model` per chunk prevents silently mixing vectors from different setups.
+7. **Trace**: chunk → episode → guest, title, date, YouTube URL at the exact second.
 
-2. **Message Storage (`messages` table)**:
-   - Each interaction persists two rows linked to `session_id`: the user's prompt (`role="user"`) and the assistant's synthesized answer (`role="assistant"`).
-   - Foreign key constraint with `ON DELETE CASCADE` ensures child messages are automatically removed when a parent session is deleted.
-   - Clients can retrieve full chronological history for any session via `GET /sessions/{session_id}/messages`.
+## 5. Retrieval and grounding
 
-3. **Multi-Turn Context Resolution**:
-   - **Retrieval Context**: For follow-up questions that depend on prior context (e.g., "What about specifically in the first week?" following a question on user retention), previous user queries are combined with the current query to ensure semantic vector search retrieves relevant chunks.
-   - **Prompt History**: The last $N$ messages (default 6) are fetched from PostgreSQL and prepended to the prompt payload before the current grounded snippets, enabling natural follow-up dialogue while keeping token usage bounded.
+```
+question ─┬─ embed ─▶ top-20 by cosine distance (pgvector) ────────────┐
+          └─ keywords (stop-words removed) ▶ top-20 full-text (tsvector)┴▶ RRF fusion
+GATE: best vector distance > RELEVANCE_MAX_DISTANCE (0.45)?  ──yes──▶ refuse, model NOT called
+else: keep chunks within threshold (keyword-only hits get +0.10 margin), max 2 per episode, top 4
+```
 
-## Model Provider Toggle
+* Follow-ups under 9 words are searched together with the previous user question.
+* The prompt numbers the excerpts `[1]…[n]`; the UI maps `[n]` to citation cards. **The sources list comes from database rows, never from model text.**
+* If the model itself replies with the refusal sentence, sources are dropped.
 
-The application decouples generation logic from specific LLM backends using an extensible provider pattern:
+## 6. Agent routing and skills
 
-1. **`LLMProvider` Interface**:
-   - Defined in `backend/app/providers/base.py` as an abstract base class with a single method:
-     ```python
-     async def chat(self, messages: list[dict]) -> str: ...
-     ```
-   - Standardizes communication so that routers never invoke provider-specific SDKs or HTTP URLs directly.
+`agent/router.py` chooses a skill from an explicit `mode` or, in `auto`, by regex rules (no extra model call; deterministic and testable). Each skill is one module with `run(ctx)`.
 
-2. **Supported Providers**:
-   - **Ollama (`OllamaProvider`)**: Local inference against Ollama's `/api/chat` (e.g., `llama3.2:3b`).
-   - **Claude (`ClaudeProvider`)**: Remote inference against Anthropic's Messages API (`https://api.anthropic.com/v1/messages`). Requires `ANTHROPIC_API_KEY`; validates key configuration on instantiation rather than import.
+| Skill | Output |
+|---|---|
+| ask | Grounded answer with `[n]` citations |
+| explain | Plain-language answer with an analogy tuned to the learner profile |
+| quiz | Markdown quiz with collapsible answers |
+| ship30 | Markdown essay. Principles are encoded as constants in `skills/ship30.py`. Strategy `sectioned` = outline + one call per section (hook, 4 sections, takeaway) so small models reach ~1,250 words; falls back to `single` if the outline cannot be parsed |
+| artifact | Markdown document or complete HTML page |
+| prd | PRD in Markdown with an evidence section |
 
-   > [!NOTE]
-   > **Cloud provider (Claude)**: Implemented against the Anthropic Messages API via `ClaudeProvider` (`backend/app/providers/claude_provider.py`). Verified at the code level — imports cleanly without a key, and raises a clear `ValueError` when instantiated without `ANTHROPIC_API_KEY` set (see `backend/app/scripts/` or test output in the agent transcripts for this verification). Live end-to-end generation via Claude was not tested in this environment, since provisioning a billed API key was out of scope for the take-home's time budget. The provider abstraction (`LLMProvider` interface) is identical for both providers, so swapping in a real key and setting `LLM_PROVIDER=claude` requires zero code changes — this is demonstrated by the local Ollama provider working through the exact same interface.
+To add a skill: new module with `NAME` and `run`, register it in `skills/__init__.py`, add a rule in `router.py`.
 
-3. **Factory & Configuration**:
-   - `get_llm_provider()` in `backend/app/config.py` inspects `settings.LLM_PROVIDER` (`"ollama"` or `"claude"`) and returns the appropriate instance.
-   - Switching providers requires zero code changes — simply update `LLM_PROVIDER` in `.env` (and ensure `ANTHROPIC_API_KEY` is provided if choosing Claude).
-   - `GET /health` reports the currently active provider in its JSON payload.
+## 7. Model toggle and fallback
 
-## Ship 30 Content Skill
+`config.get_llm_provider()` returns `OllamaProvider`, `ClaudeProvider` (HTTP) or `ClaudeAgentProvider` (Claude Agent SDK, tools disabled) from `LLM_PROVIDER`, or from the per-request `provider` override in the UI. Only the `LLMProvider` interface is visible to the rest of the code.
 
-The application provides a dedicated content generation skill via `POST /skills/ship30`. 
+* **The brief names the Claude Agent SDK; the demo must run on Ollama.** The SDK drives only Claude, so routing and skills live in our provider-agnostic `agent/` layer and the SDK is one provider. It is written against SDK 0.2.x and **has not been run against the live API**.
+* **Fallback policy:** none automatic. If Ollama is down the API returns `provider_unavailable` (503) with a hint; if a key is missing, `provider_not_configured` (400). The user switches providers explicitly, because silently sending data to a paid service would be a surprise.
 
-### Difference from Base `/chat` Endpoint
-While the `/chat` endpoint performs conversational question-answering over retrieved chunks, `POST /skills/ship30` is an opinionated ghostwriting engine. Rather than producing short conversational responses, it synthesizes retrieved podcast transcripts into an essay following the **Ship 30 for 30** online writing methodology developed by Dickie Bush and Nicolas Cole.
+## 8. Artifact security
 
-Like `/chat`, the skill is fully integrated into the session lifecycle:
-- Accepts `session_id` and `topic`.
-- Validates session existence (404 on invalid UUID).
-- Reuses the existing semantic retrieval pipeline (`search_chunks` from `retrieval.py`).
-- Persists both the user prompt and the generated essay in the `messages` table.
-- Employs the swappable `LLMProvider` abstraction.
+Generated HTML is untrusted. Three layers (`frontend/src/lib/sandbox.js`, tested):
 
-### Encoded Writing Principles
-The skill encodes concrete, visible principles in `backend/app/skills/ship30.py`:
-1. **The Hook (Lead-In)**: Opens with a punchy, 1-2 sentence declarative hook that creates curiosity and answers *Who is this for? What is this about? Why should I care right now?*
-2. **"For WHO / SO THAT" Framework**: Immediately establishes the specific target persona and the promised tangible outcome.
-3. **High Rate of Revelation (RoR)**: High information density with zero fluff, filler phrases, or passive preambles.
-4. **1-3-1 Visual Cadence**: Structures points using rhythmic alternation: 1 punchy line, 3-sentence body or 3 bullets, 1 punchy conclusion.
-5. **Skimmable Visual Architecture**: Narrative-driven markdown subheadings (`##` / `###`), bolded opening words of key insights, and high-density bulleted lists.
-6. **Strict Transcript Grounding**: Anchors claims, heuristics, and quotes exclusively in verified transcripts from Lenny's Podcast.
-7. **Actionable Takeaway**: Concludes with a concrete implementation heuristic rather than an abstract summary.
+1. `<iframe sandbox>` with **no** `allow-same-origin`: opaque origin, so no access to our storage, cookies, API identity or parent DOM. No popups, forms, downloads, top navigation. Scripts off by default; an opt-in checkbox enables them, still isolated.
+2. Injected **CSP** `default-src 'none'`: no network access of any kind, so nothing can be exfiltrated.
+3. **Sanitising**: removes scripts (unless opted in), meta refresh, base, iframes, forms, event handlers; neutralises links; keeps `data:` images.
 
-> [!NOTE]
-> **Word Count & Local Model Behavior**:
-> The prompt targets an in-depth ~1,250-word essay. In local CPU environments running `llama3.2:3b`, the model typically synthesizes high-density essays of ~600 words due to compact 3B instruct-tuning priors. Larger cloud models (such as Claude 3.5 Sonnet) expand to the full ~1,250-word target through the identical `LLMProvider` interface.
+Markdown is rendered with `rehype-sanitize` (GitHub allow-list) after `rehype-raw`. HTML artifacts cannot be printed from the parent (cross-origin frame), so they offer download instead.
 
+## 9. Observability and resilience
 
+* JSON logs, one object per line, with `request_id`. Events: `request`, `route`, `retrieval` (reason, best distance, hits, ms), `llm_call` (provider, model, ms, ok), `artifact_generated`, `client_event`, `schema_ready`, `app_error`. Try: `docker compose logs api | jq`.
+* Failures handled without a 500: Ollama down (chat and embeddings), missing key, timeout (504), empty retrieval (refusal), bad model output (502), database down (503, API still starts and `/health` shows `degraded`).
+* A failed request persists nothing, so retry never duplicates a turn.
+
+## 10. Deployment topology
+
+`docker compose up --build` starts `db` (pgvector/pgvector:pg16, volume), `api` (FastAPI on :8000, waits for DB health) and `frontend` (Vite on :5173). Ollama runs on the host and is reached at `host.docker.internal:11434`. No live cloud deployment is required by the brief.
+
+## 11. Known limits
+
+* Ingestion speed and answer quality depend on the evaluator's hardware.
+* Hybrid keyword search is OR-based with no IDF weighting; it mainly re-ranks vector candidates.
+* No Alembic, auth, streaming or reranker.
+* Claude and Agent SDK paths are code-verified only.

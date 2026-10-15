@@ -1,187 +1,117 @@
-"""Chat router implementing the RAG query endpoint.
+"""POST /chat -- the single conversational endpoint.
 
-Takes user queries, retrieves relevant chunks from PostgreSQL via pgvector,
-constructs a grounded prompt, and calls the configured LLMProvider interface
-to synthesize a cited answer with session persistence.
+`mode` picks the skill (ask | explain | quiz | ship30 | artifact | prd); "auto"
+lets the router decide from the message. `provider` optionally overrides the
+configured model for this one request (the UI's model switcher).
 """
 
 import uuid
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal, Optional
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session as DbSession
 
-from app.config import get_llm_provider
+from app.agent.runner import run_turn
+from app.config import get_llm_provider, settings
 from app.db import get_db
-from app.models import Session, Message
-from app.providers.base import LLMProvider
-from app.retrieval import search_chunks
+from app.errors import AppError, provider_error_from
+from app.models import Message, Profile, Session
 
 router = APIRouter(tags=["chat"])
 
-REFUSAL_MESSAGE = "I don't have enough information from the transcripts to answer that."
+Mode = Literal["auto", "ask", "explain", "quiz", "ship30", "artifact", "prd"]
+ProviderName = Literal["ollama", "claude", "claude-agent"]
 
 
 class ChatRequest(BaseModel):
     session_id: uuid.UUID
-    message: str
+    message: str = Field(min_length=1, max_length=4000)
+    mode: Mode = "auto"
+    provider: Optional[ProviderName] = None
+    personalize: bool = True
+
+    @field_validator("message")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("message must not be blank")
+        return v.strip()
 
 
-class SourceCitation(BaseModel):
+class Source(BaseModel):
+    n: int
+    episode_id: Optional[str] = None
+    guest: Optional[str] = None
+    title: Optional[str] = None
     source_file: str
     chunk_index: int
+    timestamp: Optional[str] = None
+    url: Optional[str] = None
+    publish_date: Optional[str] = None
+    similarity: Optional[float] = None
+    snippet: str
+
+
+class Artifact(BaseModel):
+    type: Literal["markdown", "html"]
+    title: str
+    content: str
 
 
 class ChatResponse(BaseModel):
+    message_id: uuid.UUID
+    session_id: uuid.UUID
+    mode: str
     answer: str
-    sources: list[SourceCitation]
-    error: Optional[str] = None
+    sources: list[Source]
+    artifact: Optional[Artifact] = None
+    meta: dict[str, Any]
 
 
-async def generate_rag_answer(
-    question: str,
-    chunks: list[dict],
-    history: Optional[list[Message]] = None,
-    provider: Optional[LLMProvider] = None,
-) -> tuple[str, Optional[str]]:
-    """Format prompt with retrieved context and invoke the LLMProvider interface.
+def load_profile(db: DbSession) -> Optional[dict]:
+    p = db.get(Profile, 1)
+    if not p:
+        return None
+    data = {"goal": p.goal, "background": p.background, "known_concepts": p.known_concepts or []}
+    return data if any(data.values()) else None
 
-    Returns a tuple of (answer_text, error_message).
-    """
-    # Assemble context passages
-    context_blocks = []
-    for idx, c in enumerate(chunks, 1):
-        context_blocks.append(
-            f"--- [Snippet {idx} | Source: {c['source_file']} (chunk {c['chunk_index']})] ---\n"
-            f"{c['content']}"
-        )
-    context_str = "\n\n".join(context_blocks)
 
-    system_prompt = (
-        "You are the Lenny Growth Assistant, an AI expert on product management, "
-        "growth, and startup leadership built on Lenny's Podcast transcripts.\n\n"
-        "INSTRUCTIONS:\n"
-        "1. Answer the user's question using ONLY the provided transcript snippets below.\n"
-        "2. If the provided snippets do not contain enough facts to answer the question, "
-        f"you MUST reply with: '{REFUSAL_MESSAGE}'\n"
-        "3. Do NOT make up information or use prior knowledge not contained in the context.\n"
-        "4. Be concise, direct, and authoritative in your response."
-    )
+async def process_chat(db: DbSession, req: ChatRequest) -> ChatResponse:
+    session = db.get(Session, req.session_id)
+    if not session:
+        raise AppError("session_not_found", f"Session {req.session_id} not found", 404,
+                       "Create one with POST /sessions.")
 
-    user_message = (
-        f"Context from podcast transcripts:\n\n{context_str}\n\n"
-        f"Question: {question}\n\n"
-        "Answer based only on the context above:"
-    )
+    recent = (db.query(Message).filter(Message.session_id == req.session_id)
+              .order_by(Message.created_at.desc()).limit(settings.HISTORY_MESSAGES).all())
+    history = [{"role": m.role, "content": m.content} for m in reversed(recent)]
 
-    # Construct chat messages list, including system prompt, previous conversation turns, and current query
-    messages = [{"role": "system", "content": system_prompt}]
-    if history:
-        for msg in history:
-            messages.append({"role": msg.role, "content": msg.content})
-    messages.append({"role": "user", "content": user_message})
-
-    llm = provider or get_llm_provider()
     try:
-        answer = await llm.chat(messages)
-        if not answer:
-            return REFUSAL_MESSAGE, "Empty response from LLM"
-        return answer, None
-    except Exception as e:
-        return REFUSAL_MESSAGE, str(e)
+        provider = get_llm_provider(req.provider)
+    except ValueError as e:
+        raise provider_error_from(e) from e
+
+    result = await run_turn(db, question=req.message, history=history, mode=req.mode,
+                            provider=provider, profile=load_profile(db) if req.personalize else None)
+
+    # Persist only after success, so a failed/timed-out request leaves no half-turn behind.
+    # Explicit timestamps: both rows share one transaction, and Postgres now() would tie them.
+    now = datetime.now(timezone.utc)
+    db.add(Message(session_id=req.session_id, role="user", content=req.message,
+                   mode=result["mode"], created_at=now))
+    reply = Message(session_id=req.session_id, role="assistant", content=result["answer"],
+                    mode=result["mode"], sources=result["sources"], artifact=result["artifact"],
+                    meta=result["meta"], created_at=now + timedelta(milliseconds=1))
+    db.add(reply)
+    db.commit()
+    db.refresh(reply)
+    return ChatResponse(message_id=reply.id, session_id=req.session_id, mode=result["mode"],
+                        answer=result["answer"], sources=result["sources"],
+                        artifact=result["artifact"], meta=result["meta"])
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest, db: DbSession = Depends(get_db)):
-    """Answer questions grounded in the podcast transcripts with session persistence."""
-    # 1. Validate session existence — return 404 if invalid
-    session = db.query(Session).filter(Session.id == request.session_id).first()
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {request.session_id} not found",
-        )
-
-    user_query = request.message.strip()
-    if not user_query:
-        return ChatResponse(
-            answer="Please ask a question about growth, product management, or startups.",
-            sources=[],
-        )
-
-    # 2. Retrieve recent conversation history for this session (last 6 messages)
-    recent_messages = (
-        db.query(Message)
-        .filter(Message.session_id == request.session_id)
-        .order_by(Message.created_at.desc())
-        .limit(6)
-        .all()
-    )
-    history = list(reversed(recent_messages))
-
-    # 3. Inform retrieval using conversation context for follow-up questions
-    prior_user_queries = [m.content for m in history if m.role == "user"]
-    retrieval_query = (
-        f"{prior_user_queries[-1]} {user_query}" if prior_user_queries else user_query
-    )
-
-    chunks = search_chunks(query=retrieval_query, db=db, k=3)
-    if not chunks and prior_user_queries:
-        # Fallback to standalone user query if combined context had no matches
-        chunks = search_chunks(query=user_query, db=db, k=3)
-
-    # 4. Save user message to database
-    user_record = Message(
-        session_id=request.session_id,
-        role="user",
-        content=user_query,
-    )
-    db.add(user_record)
-    db.commit()
-
-    # 5. If no chunks pass the threshold, return refusal and persist assistant response
-    if not chunks:
-        asst_record = Message(
-            session_id=request.session_id,
-            role="assistant",
-            content=REFUSAL_MESSAGE,
-        )
-        db.add(asst_record)
-        db.commit()
-        return ChatResponse(
-            answer=REFUSAL_MESSAGE,
-            sources=[],
-        )
-
-    # 6. Format source citations
-    sources = [
-        SourceCitation(
-            source_file=c["source_file"],
-            chunk_index=c["chunk_index"],
-        )
-        for c in chunks
-    ]
-
-    # 7. Synthesize answer using the swappable LLMProvider interface
-    answer, error = await generate_rag_answer(user_query, chunks, history=history)
-
-    final_answer = (
-        f"Retrieved {len(chunks)} relevant transcript chunks, but LLM generation failed: {error}"
-        if error
-        else answer
-    )
-
-    # 8. Save assistant response to database
-    asst_record = Message(
-        session_id=request.session_id,
-        role="assistant",
-        content=final_answer,
-    )
-    db.add(asst_record)
-    db.commit()
-
-    return ChatResponse(
-        answer=final_answer,
-        sources=sources if answer != REFUSAL_MESSAGE else [],
-        error=error,
-    )
+async def chat_endpoint(req: ChatRequest, db: DbSession = Depends(get_db)):
+    return await process_chat(db, req)

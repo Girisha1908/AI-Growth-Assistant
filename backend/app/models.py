@@ -1,74 +1,118 @@
-"""SQLAlchemy ORM models for chat sessions, messages, and transcript chunks.
+"""SQLAlchemy ORM models.
 
-Tables:
-1. sessions: tracks conversation sessions with timestamps and metadata.
-2. messages: tracks message history belonging to a session.
-3. chunks: stores embedded transcript chunks for RAG retrieval.
+Tables
+------
+episodes   one row per podcast episode (metadata from the transcript header)
+chunks     embedded transcript pieces; each points back to its episode
+sessions   one row per chat
+messages   chat turns (+ the sources and artifact attached to assistant turns)
+profile    single-row learner profile used to personalise answers
+notes      saved answers / artifacts (the personal library)
 """
 
 import uuid
-from sqlalchemy import Column, String, Text, DateTime, Integer, ForeignKey, func, JSON, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship
+
 from pgvector.sqlalchemy import Vector
+from sqlalchemy import (JSON, Column, Date, DateTime, ForeignKey, Integer, String, Text,
+                        UniqueConstraint, Uuid, func)
+from sqlalchemy.orm import relationship
+
 from app.db import Base
+
+EMBED_DIM = 768  # nomic-embed-text output size
+
+
+class Episode(Base):
+    __tablename__ = "episodes"
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    slug = Column(String(300), nullable=False, unique=True, index=True)  # folder name
+    source_file = Column(String(500), nullable=False)
+    guest = Column(String(300), nullable=True, index=True)
+    title = Column(Text, nullable=False)
+    youtube_url = Column(String(500), nullable=True)
+    video_id = Column(String(50), nullable=True)
+    publish_date = Column(Date, nullable=True)
+    description = Column(Text, nullable=True)
+    keywords = Column(JSON, nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
+    chunk_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    chunks = relationship("Chunk", back_populates="episode", cascade="all, delete-orphan")
+
+
+class Chunk(Base):
+    """A retrievable piece of a transcript. Traceable: chunk -> episode -> YouTube."""
+
+    __tablename__ = "chunks"
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    episode_id = Column(Uuid(as_uuid=True), ForeignKey("episodes.id", ondelete="CASCADE"),
+                        nullable=True, index=True)
+    source_file = Column(String(500), nullable=False, index=True)
+    chunk_index = Column(Integer, nullable=False)
+    content = Column(Text, nullable=False)
+    start_seconds = Column(Integer, nullable=True)  # timestamp of the chunk's first line
+    embedding = Column(Vector(EMBED_DIM), nullable=False)
+    embed_model = Column(String(100), nullable=True)  # settings.embed_tag at ingestion time
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    episode = relationship("Episode", back_populates="chunks")
+
+    __table_args__ = (UniqueConstraint("source_file", "chunk_index", name="uq_chunk_source_index"),)
+    # NOTE: a generated `tsv` tsvector column + GIN index for keyword search is
+    # created by app.migrate (Postgres-only), not mapped here.
 
 
 class Session(Base):
-    """Represents an interactive user chat session."""
-
     __tablename__ = "sessions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-    # Note: 'metadata' is a reserved attribute on SQLAlchemy Base (Base.metadata).
-    # We name the python attribute 'metadata_' while explicitly mapping it to the column name "metadata" in PostgreSQL.
+    # 'metadata' is reserved on declarative Base, so the attribute is metadata_.
     metadata_ = Column("metadata", JSON, nullable=True)
 
-    # Relationship to messages
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
 
 
 class Message(Base):
-    """Represents an individual message exchanged within a chat session."""
-
     __tablename__ = "messages"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    session_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("sessions.id", ondelete="CASCADE"),
-        nullable=False,
-    )
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(Uuid(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
     role = Column(String(50), nullable=False)
     content = Column(Text, nullable=False)
+    mode = Column(String(30), nullable=True)      # ask | ship30 | explain | quiz | artifact | prd
+    sources = Column(JSON, nullable=True)         # citations shown under an assistant answer
+    artifact = Column(JSON, nullable=True)        # {type,title,content} rendered in the viewer
+    meta = Column(JSON, nullable=True)            # provider, model, latency, retrieval stats
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    # Relationship back to session
     session = relationship("Session", back_populates="messages")
 
 
-class Chunk(Base):
-    """Stores an embedded transcript chunk for RAG retrieval.
+class Profile(Base):
+    """Single-user learner profile (id is always 1)."""
 
-    Each chunk traces back to its source file and position, enabling
-    citation of the original episode when surfacing answers.
-    """
+    __tablename__ = "profile"
 
-    __tablename__ = "chunks"
+    id = Column(Integer, primary_key=True, default=1)
+    display_name = Column(String(100), nullable=True)
+    goal = Column(Text, nullable=True)
+    background = Column(Text, nullable=True)
+    known_concepts = Column(JSON, nullable=True)  # list[str]
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(),
+                        onupdate=func.now(), nullable=False)
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    # Relative path within the transcript repo, e.g. "episodes/brian-chesky/transcript.md"
-    source_file = Column(String(500), nullable=False, index=True)
-    # Position of this chunk within its source file (0-indexed)
-    chunk_index = Column(Integer, nullable=False)
+
+class Note(Base):
+    __tablename__ = "notes"
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    title = Column(String(300), nullable=False)
+    kind = Column(String(20), nullable=False, default="note")  # note | markdown | html | answer
     content = Column(Text, nullable=False)
-    # 768 dimensions matches nomic-embed-text output
-    embedding = Column(Vector(768), nullable=False)
+    sources = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-    __table_args__ = (
-        UniqueConstraint("source_file", "chunk_index", name="uq_chunk_source_index"),
-    )
-
